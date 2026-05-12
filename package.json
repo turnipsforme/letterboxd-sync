@@ -1,0 +1,23 @@
+{
+  "name": "wrens-letterboxd-sync",
+  "version": "0.1.0",
+  "description": "Obsidian plugin to sync Letterboxd RSS into movie notes.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "esbuild main.ts --bundle --external:obsidian --format=cjs --target=es2020 --outfile=main.js --sourcemap --watch",
+    "build": "tsc -noEmit -skipLibCheck && esbuild main.ts --bundle --external:obsidian --format=cjs --target=es2020 --outfile=main.js && node scripts/copy-release-files.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "letterboxd"
+  ],
+  "author": "Wren",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.20.2",
+    "obsidian": "latest",
+    "typescript": "^5.4.2"
+  }
+}
