@@ -1,0 +1,10 @@
+{
+  "id": "wrens-letterboxd-sync",
+  "name": "Wren's Letterboxd Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Sync Letterboxd RSS watches into one Obsidian note per movie.",
+  "author": "Wren",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
