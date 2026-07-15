@@ -1,7 +1,8 @@
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 
-const root = resolve(new URL('..', import.meta.url).pathname);
+const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const files = ['main.js', 'manifest.json', 'styles.css'];
 const distDir = resolve(root, 'dist');
 
