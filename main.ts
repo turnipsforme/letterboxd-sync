@@ -1,4 +1,5 @@
 import { App, Notice, Plugin, PluginSettingTab, requestUrl, Setting, TFile } from "obsidian";
+import type { EventRef } from "obsidian";
 
 type PluginSettings = {
   username: string;
@@ -6,6 +7,7 @@ type PluginSettings = {
   syncFrequencyMinutes: number;
   syncOnStartup: boolean;
   linkWatchDates: boolean;
+  forwardLinkWatchDates: boolean;
 };
 
 type SyncState = {
@@ -38,9 +40,30 @@ type NoteParts = {
 
 type ExistingWatch = {
   watchedDate: string;
-  rating: number | null;
-  rewatch: boolean;
-  reviewText: string | null;
+};
+
+type RenderedMovieNote = {
+  content: string;
+  addedWatchDates: string[];
+};
+
+type ForwardLinkerResult = {
+  added: number;
+  skipped: number;
+  failed: number;
+};
+
+type ReflectForwardLinkerApi = {
+  forwardLinkFile(file: TFile): Promise<ForwardLinkerResult>;
+};
+
+type ObsidianCommand = {
+  id: string;
+};
+
+type ObsidianCommands = {
+  listCommands?: () => ObsidianCommand[];
+  executeCommandById?: (id: string) => boolean | void;
 };
 
 const DEFAULT_SETTINGS: PluginSettings = {
@@ -49,6 +72,7 @@ const DEFAULT_SETTINGS: PluginSettings = {
   syncFrequencyMinutes: 60 * 24,
   syncOnStartup: true,
   linkWatchDates: true,
+  forwardLinkWatchDates: false,
 };
 
 const DEFAULT_STATE: SyncState = {
@@ -72,6 +96,7 @@ const MANAGED_FRONTMATTER_KEYS = new Set([
   "last_watched",
   "lb_last_sync",
   "lb_synced_watches",
+  "lb_watch_dates",
 ]);
 
 const FREQUENCY_OPTIONS: Record<string, number> = {
@@ -81,6 +106,9 @@ const FREQUENCY_OPTIONS: Record<string, number> = {
   "Every 24 hours": 60 * 24,
   "Every week": 60 * 24 * 7,
 };
+
+const FORWARD_LINKER_COMMAND_ID = "reflect-forward-linker:process-current-note";
+const FORWARD_LINKER_METADATA_TIMEOUT_MS = 5000;
 
 export default class LetterboxdSyncPlugin extends Plugin {
   settings: PluginSettings = { ...DEFAULT_SETTINGS };
@@ -217,7 +245,7 @@ export default class LetterboxdSyncPlugin extends Plugin {
         this.state.lastSyncAt = Date.now();
       }
 
-      const summary = `Letterboxd sync: ${movieCount} movies, ${changedFiles} changed${failures.length ? `, ${failures.length} failed` : ""}.`;
+      const summary = `Letterboxd sync: ${movieCount} checked, ${changedFiles} changed${failures.length ? `, ${failures.length} failed` : ""}.`;
       if (showNotice || failures.length > 0) new Notice(summary);
       if (failures.length > 0) console.warn("Letterboxd sync failures", failures);
     } catch (error) {
@@ -237,19 +265,49 @@ export default class LetterboxdSyncPlugin extends Plugin {
     const existingContent = existingFile instanceof TFile ? await this.app.vault.read(existingFile) : "";
     const rendered = renderMovieNote(existingContent, firstEntry, sortedEntries, this.settings.linkWatchDates);
 
-    if (rendered === existingContent) {
+    if (rendered.content === existingContent) {
       this.state.movieIndex[filmKey] = path;
       return false;
     }
 
+    let movieFile: TFile;
     if (existingFile instanceof TFile) {
-      await this.app.vault.modify(existingFile, rendered);
+      await this.app.vault.modify(existingFile, rendered.content);
+      movieFile = existingFile;
     } else {
-      await this.app.vault.create(path, rendered);
+      movieFile = await this.app.vault.create(path, rendered.content);
     }
 
     this.state.movieIndex[filmKey] = path;
+    await this.forwardLinkWatchDateFile(movieFile, rendered.addedWatchDates);
     return true;
+  }
+
+  private async forwardLinkWatchDateFile(file: TFile, addedWatchDates: string[]) {
+    if (!this.settings.forwardLinkWatchDates || addedWatchDates.length === 0) return;
+
+    try {
+      await waitForDateLinksToBeIndexed(this.app, file, addedWatchDates);
+      const api = getForwardLinkerApi(this.app);
+      const result = await api.forwardLinkFile(file);
+      if (!isForwardLinkerResult(result)) {
+        throw new Error("Forward Linker returned an invalid result.");
+      }
+      if (result.failed > 0) {
+        throw new Error(`Forward Linker reported ${result.failed} failed link${result.failed === 1 ? "" : "s"}.`);
+      }
+    } catch (error) {
+      try {
+        await executeForwardLinkerCommandFallback(this.app, file);
+        const message = `Letterboxd sync: used Forward Linker command fallback for ${file.path} after adding ${formatDateList(addedWatchDates)}.`;
+        new Notice(message, 12000);
+        console.warn(message, error);
+      } catch (fallbackError) {
+        const message = `Letterboxd sync: Forward Linker failed for ${file.path} after adding ${formatDateList(addedWatchDates)}: ${getErrorMessage(error)}; fallback failed: ${getErrorMessage(fallbackError)}`;
+        new Notice(message, 12000);
+        console.error(message, { apiError: error, fallbackError });
+      }
+    }
   }
 
   private async resolveMoviePath(moviesFolder: string, entry: ParsedLetterboxdEntry): Promise<string> {
@@ -329,6 +387,15 @@ class LetterboxdSyncSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.linkWatchDates)
           .onChange(async (value) => this.plugin.updateSettings({ linkWatchDates: value })),
       );
+
+    new Setting(containerEl)
+      .setName("Forward-link new watch dates")
+      .setDesc("When new watched dates are added, call Reflect Forward Linker so daily notes can backlink the movie note.")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.forwardLinkWatchDates)
+          .onChange(async (value) => this.plugin.updateSettings({ forwardLinkWatchDates: value })),
+      );
   }
 }
 
@@ -358,7 +425,7 @@ function parseLetterboxdRss(xml: string): ParsedLetterboxdEntry[] {
 
 function parseRssItem(item: Element): ParsedLetterboxdEntry | null {
   const filmTitle = getNodeText(item, "letterboxd\\:filmTitle, filmTitle") ?? inferTitle(getNodeText(item, "title"));
-  const watchedDate = normalizeDate(getNodeText(item, "letterboxd\\:watchedDate, watchedDate") ?? "");
+  const watchedDate = getWatchedDate(item);
   const link = normalizeLetterboxdUrl(getNodeText(item, "link") ?? "");
   const filmYear = normalizeYear(getNodeText(item, "letterboxd\\:filmYear, filmYear"));
 
@@ -368,14 +435,14 @@ function parseRssItem(item: Element): ParsedLetterboxdEntry | null {
   const rewatch = parseBoolean(getNodeText(item, "letterboxd\\:rewatch, rewatch"));
   const reviewText = extractReviewText(getNodeText(item, "description"));
   const guid = getNodeText(item, "guid");
-  const filmKey = link;
+  const filmKey = canonicalizeLetterboxdFilmUrl(link);
   const entryKey = buildEntryKey(guid, filmKey, watchedDate, rating, rewatch, reviewText);
 
   return {
     filmTitle,
     filmYear,
     filmKey,
-    letterboxdUri: link,
+    letterboxdUri: filmKey,
     watchedDate,
     rating,
     rewatch,
@@ -403,9 +470,57 @@ function normalizeYear(year: string | null): string | null {
 function normalizeDate(date: string): string | null {
   const match = date.match(/\d{4}-\d{2}-\d{2}/);
   if (match) return match[0];
+  const naturalDate = parseNaturalDate(date);
+  if (naturalDate) return naturalDate;
   const parsed = new Date(date);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString().slice(0, 10);
+}
+
+function parseNaturalDate(date: string): string | null {
+  const months: Record<string, string> = {
+    january: "01",
+    february: "02",
+    march: "03",
+    april: "04",
+    may: "05",
+    june: "06",
+    july: "07",
+    august: "08",
+    september: "09",
+    october: "10",
+    november: "11",
+    december: "12",
+  };
+  const cleaned = normalizeWhitespace(date)
+    .replace(/\.$/u, "")
+    .replace(/^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+/iu, "");
+  const match = cleaned.match(/^([a-z]+)\s+(\d{1,2}),?\s+(\d{4})$/iu);
+  if (!match) return null;
+
+  const month = months[match[1].toLowerCase()];
+  const day = Number(match[2]);
+  if (!month || day < 1 || day > 31) return null;
+  return `${match[3]}-${month}-${String(day).padStart(2, "0")}`;
+}
+
+function getWatchedDate(item: Element): string | null {
+  return (
+    normalizeDate(getNodeText(item, "letterboxd\\:watchedDate, watchedDate") ?? "") ??
+    extractWatchedDate(getNodeText(item, "description")) ??
+    normalizeDate(getNodeText(item, "pubDate, dc\\:date") ?? "")
+  );
+}
+
+function extractWatchedDate(description: string | null): string | null {
+  if (!description) return null;
+  const html = decodeHtml(description);
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const watchedText = Array.from(doc.querySelectorAll("p"))
+    .map((p) => normalizeWhitespace(p.textContent ?? ""))
+    .find((text) => /^Watched on\b/i.test(text));
+  const watchedDate = watchedText?.replace(/^Watched on\s+/i, "").replace(/\.$/u, "");
+  return watchedDate ? normalizeDate(watchedDate) : null;
 }
 
 function normalizeLetterboxdUrl(url: string): string {
@@ -416,6 +531,21 @@ function normalizeLetterboxdUrl(url: string): string {
     return parsed.toString().replace(/\/$/, "");
   } catch {
     return url.trim().replace(/[?#].*$/, "").replace(/\/$/, "");
+  }
+}
+
+function canonicalizeLetterboxdFilmUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const filmIndex = parts.indexOf("film");
+    if (filmIndex !== -1 && parts.length > filmIndex + 2 && /^\d+$/.test(parts[parts.length - 1])) {
+      parts.pop();
+      parsed.pathname = `/${parts.join("/")}/`;
+    }
+    return normalizeLetterboxdUrl(parsed.toString());
+  } catch {
+    return url.replace(/\/\d+$/u, "");
   }
 }
 
@@ -471,7 +601,7 @@ function groupEntriesByFilm(entries: ParsedLetterboxdEntry[]): Map<string, Parse
   return grouped;
 }
 
-function renderMovieNote(existingContent: string, entry: ParsedLetterboxdEntry, incomingEntries: ParsedLetterboxdEntry[], linkDates: boolean): string {
+function renderMovieNote(existingContent: string, entry: ParsedLetterboxdEntry, incomingEntries: ParsedLetterboxdEntry[], linkDates: boolean): RenderedMovieNote {
   const existing = parseNote(existingContent);
   const syncedKeys = readStringArray(existing.frontmatter.lb_synced_watches);
   const syncedKeySet = new Set(syncedKeys);
@@ -487,6 +617,10 @@ function renderMovieNote(existingContent: string, entry: ParsedLetterboxdEntry, 
     knownDateSet.add(watch.watchedDate);
   }
 
+  if (existingContent.length > 0 && newEntries.length === 0) {
+    return { content: existingContent, addedWatchDates: [] };
+  }
+
   const allKeys = [...syncedKeys, ...newEntries.map((watch) => watch.entryKey)];
   const allDates = [...knownDates, ...newEntries.map((watch) => watch.watchedDate)].sort();
   const uniqueDates = Array.from(new Set(allDates));
@@ -494,7 +628,10 @@ function renderMovieNote(existingContent: string, entry: ParsedLetterboxdEntry, 
   const frontmatter = buildFrontmatter(existing.frontmatter, entry, allKeys, uniqueDates, hasReview, newEntries.length > 0 || existingContent.length === 0);
   const body = renderBody(existing.body, entry, newEntries, linkDates, existingContent.length === 0);
 
-  return `${renderFrontmatter(frontmatter)}\n${body}`.replace(/\s+$/u, "") + "\n";
+  return {
+    content: `${renderFrontmatter(frontmatter)}\n${body}`.replace(/\s+$/u, "") + "\n",
+    addedWatchDates: newEntries.map((watch) => watch.watchedDate),
+  };
 }
 
 function parseNote(content: string): NoteParts {
@@ -551,7 +688,7 @@ function unquoteYaml(value: string): string {
 function buildFrontmatter(existing: Record<string, unknown>, entry: ParsedLetterboxdEntry, syncedKeys: string[], dates: string[], hasReview: boolean, touched: boolean): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(existing)) {
-    if (!MANAGED_FRONTMATTER_KEYS.has(key) && key !== "lb_watch_dates") result[key] = value;
+    if (!MANAGED_FRONTMATTER_KEYS.has(key)) result[key] = value;
   }
 
   result.title = entry.filmTitle;
@@ -563,7 +700,7 @@ function buildFrontmatter(existing: Record<string, unknown>, entry: ParsedLetter
   result.studio = "";
   result.genre = "";
   result.review = hasReview ? "yes" : "no";
-  result.watch_count = syncedKeys.length;
+  result.watch_count = dates.length;
   result.first_watched = dates[0] ?? "";
   result.last_watched = dates[dates.length - 1] ?? "";
   result.lb_last_sync = touched || typeof existing.lb_last_sync !== "string" ? new Date().toISOString() : existing.lb_last_sync;
@@ -653,10 +790,7 @@ function renderWatchLine(watch: ParsedLetterboxdEntry, linkDates: boolean): stri
 function isDuplicateWatch(watch: ParsedLetterboxdEntry, syncedKeySet: Set<string>, knownDateSet: Set<string>, existingWatches: ExistingWatch[]): boolean {
   if (syncedKeySet.has(watch.entryKey)) return true;
   if (knownDateSet.has(watch.watchedDate)) return true;
-
-  return existingWatches
-    .filter((existingWatch) => existingWatch.watchedDate === watch.watchedDate)
-    .some((existingWatch) => isFuzzyWatchMatch(watch, existingWatch));
+  return existingWatches.some((existingWatch) => existingWatch.watchedDate === watch.watchedDate);
 }
 
 function parseExistingWatches(body: string): ExistingWatch[] {
@@ -670,60 +804,9 @@ function parseExistingWatchLine(line: string): ExistingWatch | null {
   const dateMatch = line.match(/^\s*-\s*(?:\[\[(?:[^\]\n]*\/)?(\d{4}-\d{2}-\d{2})(?:\|[^\]\n]*)?\]\]|\[(?:[^\]\n]*\/)?(\d{4}-\d{2}-\d{2})\]\(<?[^)\n>]*>?\)|(\d{4}-\d{2}-\d{2}))/);
   if (!dateMatch) return null;
 
-  const parts = line.split("—").slice(1).map((part) => part.trim());
-  const ratingPart = parts.find((part) => /^rating:/i.test(part));
-  const reviewPart = parts.find((part) => /^review:/i.test(part));
-
   return {
     watchedDate: dateMatch[1] ?? dateMatch[2] ?? dateMatch[3],
-    rating: ratingPart ? parseRating(ratingPart.replace(/^rating:\s*/i, "")) : null,
-    rewatch: parts.some((part) => /^rewatch:\s*yes$/i.test(part)),
-    reviewText: reviewPart ? normalizeWhitespace(reviewPart.replace(/^review:\s*/i, "")) || null : null,
   };
-}
-
-function isFuzzyWatchMatch(incoming: ParsedLetterboxdEntry, existing: ExistingWatch): boolean {
-  if (incoming.rating !== existing.rating || incoming.rewatch !== existing.rewatch) return false;
-  if (!incoming.reviewText && !existing.reviewText) return true;
-  return areReviewsSimilar(incoming.reviewText, existing.reviewText);
-}
-
-function areReviewsSimilar(a: string | null, b: string | null): boolean {
-  const left = normalizeReviewForComparison(a ?? "");
-  const right = normalizeReviewForComparison(b ?? "");
-  if (!left || !right) return left === right;
-  if (left === right) return true;
-
-  const shorter = left.length < right.length ? left : right;
-  const longer = left.length < right.length ? right : left;
-  if (shorter.length >= 40 && longer.includes(shorter)) return true;
-
-  return bigramSimilarity(left, right) >= 0.88;
-}
-
-function normalizeReviewForComparison(value: string): string {
-  return normalizeWhitespace(value.toLowerCase().replace(/[^a-z0-9\s]/g, ""));
-}
-
-function bigramSimilarity(a: string, b: string): number {
-  if (a.length < 2 || b.length < 2) return a === b ? 1 : 0;
-
-  const counts = new Map<string, number>();
-  for (let i = 0; i < a.length - 1; i += 1) {
-    const bigram = a.slice(i, i + 2);
-    counts.set(bigram, (counts.get(bigram) ?? 0) + 1);
-  }
-
-  let overlap = 0;
-  for (let i = 0; i < b.length - 1; i += 1) {
-    const bigram = b.slice(i, i + 2);
-    const count = counts.get(bigram) ?? 0;
-    if (count === 0) continue;
-    counts.set(bigram, count - 1);
-    overlap += 1;
-  }
-
-  return (2 * overlap) / (a.length + b.length - 2);
 }
 
 function readStringArray(value: unknown): string[] {
@@ -765,6 +848,103 @@ async function ensureFolder(app: App, folderPath: string) {
       await app.vault.createFolder(current);
     }
   }
+}
+
+async function waitForDateLinksToBeIndexed(app: App, file: TFile, dates: string[]): Promise<void> {
+  const pendingDates = Array.from(new Set(dates.filter(isIsoDate)));
+  if (pendingDates.length === 0 || hasIndexedDateLinks(app, file, pendingDates)) return;
+
+  await new Promise<void>((resolve) => {
+    let resolved = false;
+    let timeoutId: number | null = null;
+    let changedRef: EventRef | null = null;
+    let resolveRef: EventRef | null = null;
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      if (changedRef) app.metadataCache.offref(changedRef);
+      if (resolveRef) app.metadataCache.offref(resolveRef);
+      resolve();
+    };
+    const check = (changedFile?: TFile) => {
+      if (changedFile && changedFile.path !== file.path) return;
+      if (hasIndexedDateLinks(app, file, pendingDates)) finish();
+    };
+    changedRef = app.metadataCache.on("changed", (changedFile) => check(changedFile));
+    resolveRef = app.metadataCache.on("resolve", (resolvedFile) => check(resolvedFile));
+
+    timeoutId = window.setTimeout(finish, FORWARD_LINKER_METADATA_TIMEOUT_MS);
+    check();
+  });
+}
+
+function hasIndexedDateLinks(app: App, file: TFile, dates: string[]): boolean {
+  const cache = app.metadataCache.getFileCache(file);
+  const indexedDates = new Set<string>();
+  cache?.links?.forEach((link) => {
+    const leaf = link.link.split("|")[0].split("/").pop() ?? link.link;
+    const match = leaf.match(/^<?(\d{4}-\d{2}-\d{2})(?:\.md)?>?$/);
+    if (match) indexedDates.add(match[1]);
+  });
+
+  return dates.every((date) => indexedDates.has(date));
+}
+
+function getForwardLinkerApi(app: App): ReflectForwardLinkerApi {
+  const api = (app as App & { plugins?: { plugins?: Record<string, { api?: unknown }> } }).plugins?.plugins?.["reflect-forward-linker"]?.api;
+  if (!isForwardLinkerApi(api)) {
+    throw new Error("Reflect Forward Linker plugin is not enabled or API is unavailable.");
+  }
+
+  return api;
+}
+
+async function executeForwardLinkerCommandFallback(app: App, file: TFile): Promise<void> {
+  const commands = (app as App & { commands?: ObsidianCommands }).commands;
+  if (typeof commands?.executeCommandById !== "function") {
+    throw new Error("Obsidian command API is unavailable.");
+  }
+
+  const listedCommands = typeof commands.listCommands === "function" ? commands.listCommands() : null;
+  if (listedCommands && !listedCommands.some((command) => command.id === FORWARD_LINKER_COMMAND_ID)) {
+    throw new Error("Forward Linker command is unavailable.");
+  }
+
+  const previousFile = app.workspace.getActiveFile();
+  const leaf = app.workspace.getLeaf(false);
+  try {
+    await leaf.openFile(file, { active: true });
+    app.workspace.setActiveLeaf(leaf, { focus: false });
+
+    const executed = commands.executeCommandById(FORWARD_LINKER_COMMAND_ID);
+    if (executed === false) {
+      throw new Error("Forward Linker command declined to run.");
+    }
+  } finally {
+    if (previousFile && previousFile.path !== file.path) {
+      await leaf.openFile(previousFile, { active: true });
+      app.workspace.setActiveLeaf(leaf, { focus: false });
+    }
+  }
+}
+
+function isForwardLinkerApi(api: unknown): api is ReflectForwardLinkerApi {
+  return typeof api === "object" && api !== null && typeof (api as ReflectForwardLinkerApi).forwardLinkFile === "function";
+}
+
+function isForwardLinkerResult(result: unknown): result is ForwardLinkerResult {
+  return (
+    typeof result === "object" &&
+    result !== null &&
+    typeof (result as ForwardLinkerResult).added === "number" &&
+    typeof (result as ForwardLinkerResult).skipped === "number" &&
+    typeof (result as ForwardLinkerResult).failed === "number"
+  );
+}
+
+function formatDateList(dates: string[]): string {
+  return dates.length === 1 ? dates[0] : `${dates.length} watched dates`;
 }
 
 function normalizeWhitespace(value: string): string {
