@@ -423,7 +423,7 @@ class LetterboxdSyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    new Setting(containerEl).setName("Letterboxd Sync").setHeading();
+    new Setting(containerEl).setName("Settings").setHeading();
     containerEl.createEl("p", {
       text: "RSS only includes recent diary items. Keep plugin enabled for continuous history.",
     });

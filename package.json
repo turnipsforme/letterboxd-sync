@@ -1,6 +1,6 @@
 {
   "name": "letterboxd-sync",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Obsidian plugin to sync Letterboxd RSS into movie notes.",
   "main": "main.js",
   "scripts": {
