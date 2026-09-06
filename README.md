@@ -9,7 +9,7 @@ Once the plugin is available in the Obsidian Community directory, install and en
 For a manual installation:
 
 1. Build the plugin.
-2. Copy `main.js`, `manifest.json`, and `styles.css` into `.obsidian/plugins/letterboxd-sync/`.
+2. Copy `main.js` and `manifest.json` into `.obsidian/plugins/letterboxd-sync/`.
 3. Enable the plugin in Obsidian.
 
 ## Use

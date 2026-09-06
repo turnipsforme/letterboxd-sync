@@ -32,7 +32,6 @@ jobs:
           subject-path: |
             main.js
             manifest.json
-            styles.css
 
       - name: Create draft release
         env:
@@ -42,4 +41,4 @@ jobs:
           gh release create "$tag" \
             --title="$tag" \
             --draft \
-            main.js manifest.json styles.css
+            main.js manifest.json

@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const files = ['main.js', 'manifest.json', 'styles.css'];
+const files = ['main.js', 'manifest.json'];
 const distDir = resolve(root, 'dist');
 
 if (!existsSync(distDir)) {
