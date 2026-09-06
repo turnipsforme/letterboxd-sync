@@ -341,11 +341,89 @@ class LetterboxdSyncSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  getSettingDefinitions() {
+    return [
+      {
+        type: "group",
+        heading: "Letterboxd Sync",
+        items: [
+          {
+            name: "Letterboxd username",
+            desc: "Username only, not full URL.",
+            control: { type: "text", key: "username", placeholder: "wren" },
+          },
+          {
+            name: "Movies folder",
+            desc: "Plugin creates nested folders when needed.",
+            control: { type: "text", key: "moviesFolder", placeholder: "Movies" },
+          },
+          {
+            name: "Sync frequency",
+            desc: "Startup catch-up runs when interval has elapsed.",
+            control: {
+              type: "dropdown",
+              key: "syncFrequencyMinutes",
+              options: Object.fromEntries(
+                Object.entries(FREQUENCY_OPTIONS).map(([label, minutes]) => [String(minutes), label]),
+              ),
+            },
+          },
+          {
+            name: "Sync on startup",
+            desc: "Syncs on app load if interval expired.",
+            control: { type: "toggle", key: "syncOnStartup" },
+          },
+          {
+            name: "Link watch dates",
+            desc: "Render watch dates as [[YYYY-MM-DD]].",
+            control: { type: "toggle", key: "linkWatchDates" },
+          },
+          {
+            name: "Forward-link new watch dates",
+            desc: "When new watched dates are added, call Reflect Forward Linker so daily notes can backlink the movie note.",
+            control: { type: "toggle", key: "forwardLinkWatchDates" },
+          },
+        ],
+      },
+    ];
+  }
+
+  getControlValue(key: string): unknown {
+    return this.plugin.settings[key as keyof PluginSettings];
+  }
+
+  async setControlValue(key: string, value: unknown): Promise<void> {
+    if (key === "username" && typeof value === "string") {
+      await this.plugin.updateSettings({ username: value.trim() });
+      return;
+    }
+
+    if (key === "moviesFolder" && typeof value === "string") {
+      await this.plugin.updateSettings({ moviesFolder: value });
+      return;
+    }
+
+    if (key === "syncFrequencyMinutes" && typeof value === "string") {
+      const syncFrequencyMinutes = Number(value);
+      if (Object.values(FREQUENCY_OPTIONS).includes(syncFrequencyMinutes)) {
+        await this.plugin.updateSettings({ syncFrequencyMinutes });
+      }
+      return;
+    }
+
+    if (
+      (key === "syncOnStartup" || key === "linkWatchDates" || key === "forwardLinkWatchDates") &&
+      typeof value === "boolean"
+    ) {
+      await this.plugin.updateSettings({ [key]: value });
+    }
+  }
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Letterboxd Sync" });
+    new Setting(containerEl).setName("Letterboxd Sync").setHeading();
     containerEl.createEl("p", {
       text: "RSS only includes recent diary items. Keep plugin enabled for continuous history.",
     });
@@ -584,9 +662,9 @@ function extractReviewText(description: string | null): string | null {
 }
 
 function decodeHtml(value: string): string {
-  const textarea = document.createElement("textarea");
-  textarea.innerHTML = value;
-  return textarea.value;
+  const textareaSource = value.replace(/<\/textarea/giu, "&lt;/textarea");
+  const document = new DOMParser().parseFromString(`<textarea>${textareaSource}</textarea>`, "text/html");
+  return document.querySelector("textarea")?.value ?? value;
 }
 
 function buildEntryKey(guid: string | null, filmKey: string, watchedDate: string, rating: number | null, rewatch: boolean, reviewText: string | null): string {
