@@ -66,6 +66,12 @@ type ObsidianCommands = {
   executeCommandById?: (id: string) => boolean | void;
 };
 
+function formatSyncNotice(changedMovieTitles: string[]): string {
+  if (changedMovieTitles.length === 0) return "Letterboxd synced.";
+  if (changedMovieTitles.length === 1) return `Added ${changedMovieTitles[0]}!`;
+  return `Added ${changedMovieTitles.length} movies!`;
+}
+
 const DEFAULT_SETTINGS: PluginSettings = {
   username: "",
   moviesFolder: "Movies",
@@ -125,14 +131,14 @@ export default class LetterboxdSyncPlugin extends Plugin {
     }
 
     this.addCommand({
-      id: "sync-letterboxd-now",
-      name: "Sync Letterboxd now",
+      id: "sync-now",
+      name: "Sync now",
       callback: () => void this.syncNow(true),
     });
 
     this.addCommand({
-      id: "open-letterboxd-sync-settings",
-      name: "Open Letterboxd sync settings",
+      id: "open-settings",
+      name: "Open settings",
       callback: () => {
         const setting = (this.app as App & { setting?: { open: () => void; openTabById: (id: string) => void } }).setting;
         setting?.open();
@@ -224,6 +230,7 @@ export default class LetterboxdSyncPlugin extends Plugin {
     const failures: string[] = [];
     let changedFiles = 0;
     let movieCount = 0;
+    const changedMovieTitles: string[] = [];
 
     try {
       const entries = await fetchLetterboxdEntries(username);
@@ -234,7 +241,10 @@ export default class LetterboxdSyncPlugin extends Plugin {
         try {
           const changed = await this.syncMovie(moviesFolder, filmKey, movieEntries);
           movieCount += 1;
-          if (changed) changedFiles += 1;
+          if (changed) {
+            changedFiles += 1;
+            changedMovieTitles.push(movieEntries[0]?.filmTitle ?? filmKey);
+          }
         } catch (error) {
           failures.push(`${movieEntries[0]?.filmTitle ?? filmKey}: ${getErrorMessage(error)}`);
           console.error("Letterboxd movie sync failed", error);
@@ -245,7 +255,9 @@ export default class LetterboxdSyncPlugin extends Plugin {
         this.state.lastSyncAt = Date.now();
       }
 
-      const summary = `Letterboxd sync: ${movieCount} checked, ${changedFiles} changed${failures.length ? `, ${failures.length} failed` : ""}.`;
+      const summary = failures.length > 0
+        ? `Letterboxd sync: ${movieCount} checked, ${changedFiles} changed, ${failures.length} failed.`
+        : formatSyncNotice(changedMovieTitles);
       if (showNotice || failures.length > 0) new Notice(summary);
       if (failures.length > 0) console.warn("Letterboxd sync failures", failures);
     } catch (error) {
@@ -333,7 +345,7 @@ class LetterboxdSyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Wren's Letterboxd Sync" });
+    containerEl.createEl("h2", { text: "Letterboxd Sync" });
     containerEl.createEl("p", {
       text: "RSS only includes recent diary items. Keep plugin enabled for continuous history.",
     });

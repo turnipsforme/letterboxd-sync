@@ -1,0 +1,8 @@
+.DS_Store
+data.json
+dist/
+main.js
+node_modules/
+release/
+*.zip
+*.js.map
