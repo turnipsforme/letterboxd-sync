@@ -1,9 +1,9 @@
 {
   "id": "letterboxd-sync",
   "name": "Letterboxd Sync",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "minAppVersion": "1.5.0",
-  "description": "Sync Letterboxd RSS watches into one Obsidian note per movie.",
+  "description": "Sync Letterboxd RSS watches into one note per movie.",
   "author": "Wren",
   "isDesktopOnly": false
 }
